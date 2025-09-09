@@ -66,65 +66,45 @@ for i, th in enumerate(theta_grid):
     for j, thd in enumerate(thetadot_grid):
         s = state_index(i, j)
         for a, u in enumerate(u_grid):
-            # reward at current (s,a)
             R[s, a] = reward(th, thd, u)
-            # next continuous state
             th_n, thd_n = step_euler(th, thd, u)
-            # map to 3 nearest grid states
             nn_idx, p = nearest3_probs(th_n, thd_n)
             NS_idx[s, a, :] = nn_idx
             NS_prob[s, a, :] = p
 
 # =======================
-#     POLICY ITERATION
+#       VALUE ITERATION
 # =======================
 
-# Represent policy as a deterministic action index per state: pi[s] in {0..A-1}
-# Start from uniform-random policy (deterministic tie-breaker: middle action)
-pi = np.full(S, A // 2, dtype=int)
-
-def policy_evaluation(pi, V_init=None, tol=1e-6, max_iters=10000):
-    """Iterative policy evaluation for deterministic pi (action index per state)."""
-    V = np.zeros(S) if V_init is None else V_init.copy()
-    for k in range(max_iters):
-        # For each state s, use chosen action a = pi[s]
-        a = pi  # shape (S,)
-        # Expected next value under chosen action
-        EV_next = (NS_prob[np.arange(S), a] * V[NS_idx[np.arange(S), a]]).sum(axis=1)  # (S,)
-        V_new = R[np.arange(S), a] + gamma * EV_next
-        if np.max(np.abs(V_new - V)) < tol:
-            # print(f"Policy evaluation converged in {k+1} iterations.")
-            return V_new
-        V = V_new
-    # print("Policy evaluation reached max_iters without meeting tolerance.")
-    return V
-
-def policy_improvement(V, pi_old=None):
-    """Greedy improvement: pi'(s) = argmax_a [ R(s,a) + gamma * E[V(s')] ]."""
-    # Compute Q(s,a) = R + gamma * sum_j P(s,a,j) V(ns_j)
-    EV_next = (NS_prob * V[NS_idx]).sum(axis=2)      # (S, A)
-    Q = R + gamma * EV_next                           # (S, A)
-    pi_new = np.argmax(Q, axis=1).astype(int)         # greedy deterministic policy
-    stable = (pi_old is not None) and np.array_equal(pi_new, pi_old)
-    return pi_new, stable
-
-# Main PI loop
-max_pi_iters = 100
+# Bellman optimality update:
+# V_{k+1}(s) = max_a [ R(s,a) + gamma * sum_j P(s,a,j) * V_k(ns_j) ]
 V = np.zeros(S)
-for it in range(max_pi_iters):
-    # Policy evaluation
-    V = policy_evaluation(pi, V_init=V, tol=1e-6, max_iters=10000)
-    # Policy improvement
-    pi_new, stable = policy_improvement(V, pi_old=pi)
-    print(f"[PI] Iter {it+1}: policy changed = {not stable}")
-    pi = pi_new
-    if stable:
-        print("Policy iteration converged: policy stable.")
-        break
-else:
-    print("Reached max_pi_iters without policy stability (may still be near-optimal).")
+tol = 1e-6
+max_vi_iters = 1000
 
-# ----- Visualization -----
+for k in range(max_vi_iters):
+    # Expected next V for every (s,a), given current V_k
+    EV_next = (NS_prob * V[NS_idx]).sum(axis=2)   # shape (S, A)
+    Q = R + gamma * EV_next                       # shape (S, A)
+    V_new = np.max(Q, axis=1)                     # greedy backup over actions
+
+    delta = np.max(np.abs(V_new - V))
+    # Optional: a stopping rule aligned with policy loss bound could scale tol
+    # e.g., stop when delta <= tol * (1 - gamma) / (2 * gamma)
+    if delta < tol:
+        V = V_new
+        print(f"Value Iteration converged in {k+1} iterations (sup-norm change {delta:.2e}).")
+        break
+    V = V_new
+else:
+    print(f"Reached max_vi_iters={max_vi_iters} (last sup-norm change {delta:.2e}).")
+
+# Greedy policy extraction from the final V
+EV_next = (NS_prob * V[NS_idx]).sum(axis=2)   # recompute with final V
+Q = R + gamma * EV_next
+pi = np.argmax(Q, axis=1)                     # deterministic greedy policy (indices)
+
+# ----- Visualization: Value function -----
 V_grid = V.reshape(N_theta, N_thetadot)
 
 fig, ax = plt.subplots(figsize=(7,5), dpi=120)
@@ -137,31 +117,33 @@ im = ax.imshow(
     cmap="viridis"
 )
 cbar = fig.colorbar(im, ax=ax)
-cbar.set_label(r"$V^{\pi}(\theta,\dot{\theta})$ (final PI)")
+cbar.set_label(r"$V^*(\theta,\dot{\theta})$ (Value Iteration)")
 
 ax.set_xlabel(r"$\dot{\theta}$")
 ax.set_ylabel(r"$\theta$")
-ax.set_title(r"State-value $V$ after Policy Iteration")
+ax.set_title(r"State-value $V$ after Value Iteration")
 
 plt.tight_layout()
 plt.show()
 
-# Visualize the greedy action *value* (torque)
-pi_grid = pi.reshape(N_theta, N_thetadot)          # action indices
-action_values = u_grid[pi_grid]                    # map indices -> torques
+# ----- Visualization: Greedy torque field -----
+pi_grid = pi.reshape(N_theta, N_thetadot)   # action indices
+action_values = u_grid[pi_grid]             # map indices -> torques
 
 plt.figure(figsize=(7,5), dpi=120)
-im = plt.imshow(action_values,
-           origin="lower",
-           extent=[thetadot_grid.min(), thetadot_grid.max(),
-                   theta_grid.min(), theta_grid.max()],
-           aspect="auto", cmap="coolwarm")         # diverging colormap good for ± torque
+im = plt.imshow(
+    action_values,
+    origin="lower",
+    extent=[thetadot_grid.min(), thetadot_grid.max(),
+            theta_grid.min(), theta_grid.max()],
+    aspect="auto",
+    cmap="coolwarm"   # good for ± torque
+)
 cbar = plt.colorbar(im)
 cbar.set_label("Greedy action value (torque)")
 
 plt.xlabel(r"$\dot{\theta}$")
 plt.ylabel(r"$\theta$")
-plt.title("Greedy policy (torque) after PI")
+plt.title("Greedy policy (torque) extracted from Value Iteration")
 plt.tight_layout()
 plt.show()
-
