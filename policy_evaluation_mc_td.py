@@ -7,7 +7,7 @@ Compare policy-evaluation methods in a tabular MDP (Random Walk):
 - TD(lambda) with accumulating eligibility traces
 
 Usage:
-    python policy_evaluation_mc_td.py --episodes 200 --runs 50 --alpha-td 0.1 --alpha-nstep 0.1 --alpha-lambda 0.1 --lam 0.9 --n-step 3
+    python policy_evaluation_mc_td.py --episodes 200 --runs 50 --alpha-td 0.1 --alpha-nstep 0.1 --alpha-lambda 0.1 --lam 0.9 --n-step 3 --mc-alpha 0.1
 
 Outputs:
     - mc_td_comparison.png  : plot of mean-squared value error vs episodes
@@ -86,17 +86,25 @@ def mc_first_visit(env_seed: int, episodes: int, alpha: float = 0.0) -> np.ndarr
 
         # Compute returns g_t backward; update first-visit only
         G = 0.0
-        visited = set()
+        G_list = [0.0] * len(trajectory)   # trajectory is a list of (state, reward) pairs
         for t in reversed(range(len(trajectory))):
             s_t, r_t = trajectory[t]
-            G = r_t + env.gamma * G
-            if s_t not in visited:
-                visited.add(s_t)
-                if alpha > 0:
-                    V[s_t] += alpha * (G - V[s_t])
-                else:
-                    counts[s_t] += 1.0
-                    V[s_t] += (G - V[s_t]) / counts[s_t]
+            G = r_t + env.gamma * G        # discounted return
+            G_list[t] = G                  # store return starting at time t
+
+        # Forward pass: update V only at the first time each state appears in the episode
+        visited = set()
+        for t, (s_t, _) in enumerate(trajectory):
+            # if s_t in visited:             # skip if we've already seen this state earlier
+            #     continue
+            visited.add(s_t)
+
+            G = G_list[t]                  # use the return from this first occurrence
+            if alpha > 0:                  # constant step-size update
+                V[s_t] += alpha * (G - V[s_t])
+            else:                          # sample-average update (1 / visit count)
+                counts[s_t] += 1.0
+                V[s_t] += (G - V[s_t]) / counts[s_t]
 
         errors[ep] = mse(V, V_true)
 
@@ -346,9 +354,10 @@ def main():
 
     # Plot
     palette = {
+        f"MC (alpha={args.mc_alpha})"   : "#D62728",  # red
         "MC (first-visit, sample-avg)"  : "#1f77b4",  # blue
         "TD(0)"                         : "#ff7f0e",  # orange
-        "3-step TD"                     : "#2ca02c",  # green
+        f"{args.n_step}-step TD"        : "#2ca02c",  # green
     }
     plt.figure(figsize=(10, 6))
     x = np.arange(1, args.episodes + 1)
