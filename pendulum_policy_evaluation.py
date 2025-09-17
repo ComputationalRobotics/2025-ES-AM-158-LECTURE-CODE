@@ -8,9 +8,9 @@ gamma = 0.97
 eps = 1e-8
 
 # Grids
-N_theta = 41
-N_thetadot = 41
-N_u = 21
+N_theta = 21
+N_thetadot = 21
+N_u = 1
 
 theta_grid = np.linspace(-np.pi, np.pi, N_theta)
 thetadot_grid = np.linspace(-np.pi, np.pi, N_thetadot)
