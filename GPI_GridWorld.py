@@ -135,6 +135,19 @@ def epsilon_greedy(Q, s, eps, rng):
 def greedy_policy_from_Q(Q):
     return np.argmax(Q, axis=1)
 
+def rollout(env, policy, max_steps=None):
+    s = env.reset(random_start=False)
+    total_r = 0.0
+    steps = 0
+    max_steps = max_steps or env.max_steps
+    done = False
+    while not done and steps < max_steps:
+        a = int(policy[s])
+        s, r, done, _ = env.step(a)
+        total_r += r
+        steps += 1
+    return total_r, steps, done
+
 def mask_valid_states(env):
     valid = np.ones(env.n_states, dtype=bool)
     for (r,c) in env.obstacles:
@@ -245,7 +258,7 @@ gamma = 0.99
 Q_star = value_iteration_Qstar(env, gamma=gamma)
 valid_mask = mask_valid_states(env)
 
-episodes = 3000
+episodes = 5000
 Q_mc, mc_rmse, mc_linf = mc_control_with_error(env, episodes=episodes, gamma=gamma,
                                                eps_start=1.0, eps_end=0.01,
                                                Q_star=Q_star, valid_mask=valid_mask, seed=0)
@@ -275,3 +288,20 @@ plt.title("Convergence of Q estimates to Q* on GridWorld")
 plt.legend()
 plt.tight_layout()
 plt.show()
+
+
+pol_mc = greedy_policy_from_Q(Q_mc)
+pol_sa = greedy_policy_from_Q(Q_sa)
+pol_es  = greedy_policy_from_Q(Q_es)
+
+# Validate by rolling out from the fixed start
+res = {}
+for name, pol in [("MC Control", pol_mc), ("SARSA", pol_sa), ("Expected SARSA", pol_es)]:
+    total_r, steps, done = rollout(env, pol)
+    res[name] = (total_r, steps, done)
+
+# Display policies and performance
+print("GridWorld (5x5) — Start=(4,0), Goal=(0,4), obstacles at (1,1),(2,1),(3,1)")
+print("\nMC Control (greedy policy):\n", env.render_policy(pol_mc))
+print("\nSARSA (greedy policy):\n", env.render_policy(pol_sa))
+print("\nExpected SARSA (greedy policy):\n", env.render_policy(pol_es))
