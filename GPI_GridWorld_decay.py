@@ -370,12 +370,12 @@ Q_es, es_rmse, es_linf = expected_sarsa_with_error(env, episodes=episodes, gamma
                                                    eps0=1.0, eps_min=0.01,
                                                    Q_star=Q_star, valid_mask=valid_mask, seed=2)
 Q_ql, ql_rmse, ql_linf = q_learning_with_error(env, episodes=episodes, gamma=gamma,
-                                               alpha0=1.0, beta=1.0,
+                                               alpha0=1.0, beta=0.5,
                                                eps0=1.0, eps_min=0.01,
                                                Q_star=Q_star, valid_mask=valid_mask, seed=3)
 
 Q_dq, dq_rmse, dq_linf = double_q_learning_with_error(
-    env, episodes=episodes, gamma=0.99, alpha0=1.0, beta=1.0,
+    env, episodes=episodes, gamma=0.99, alpha0=1.0, beta=0.5,
     eps0=1.0, eps_min=0.01, Q_star=Q_star, valid_mask=valid_mask, seed=4
 )
 
