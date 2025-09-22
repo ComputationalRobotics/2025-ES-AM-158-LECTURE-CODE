@@ -1,5 +1,3 @@
-# Decaying-stepsize version: per-(s,a) Robbins–Monro schedule alpha_t(s,a) = alpha0 / (1 + N_t(s,a))^beta
-# Also switch to a harmonic epsilon schedule to satisfy GLIE more closely.
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -169,7 +167,6 @@ def harmonic_eps(ep, eps0=1.0, eps_min=0.01, scale=50.0):
     return eps if eps > eps_min else eps_min
 
 def stepsize_from_count(count, alpha0=1.0, beta=1.0):
-    # Robbins–Monro: sum alpha = ∞, sum alpha^2 < ∞, e.g., 1/n (beta=1) or 1/n^beta with beta in (0.5,1].
     return alpha0 / (count ** beta)
 
 # --------------- Algorithms with decaying step sizes ---------------
@@ -191,7 +188,6 @@ def mc_control_with_error(env, episodes=5000, gamma=0.99, eps0=1.0, eps_min=0.01
             s = s_next
             if len(traj) >= env.max_steps: break
       
-        
         # reverse traversal to compute returns
         G = 0.0
         returns = [0.0] * len(traj)
@@ -200,10 +196,8 @@ def mc_control_with_error(env, episodes=5000, gamma=0.99, eps0=1.0, eps_min=0.01
             G = gamma * G + r_t1
             returns[t] = G
 
-        # Every-visit MC update
-        visited = set()
+        # Every-visit MC update with sample-average stepsizes
         for t, (s_t, a_t, _) in enumerate(traj):
-            visited.add((s_t, a_t))
             N[s_t, a_t] += 1
             alpha = 1 / N[s_t, a_t] 
             Q[s_t, a_t] += alpha * (returns[t] - Q[s_t, a_t])
@@ -216,7 +210,7 @@ def mc_control_with_error(env, episodes=5000, gamma=0.99, eps0=1.0, eps_min=0.01
 def sarsa_with_error(env, episodes=5000, gamma=0.99, alpha0=1.0, beta=1.0, eps0=1.0, eps_min=0.01, Q_star=None, valid_mask=None, seed=1):
     rng = np.random.default_rng(seed)
     Q = np.zeros((env.n_states, env.n_actions))
-    N = np.zeros_like(Q, dtype=np.int64)  # visit counts for per-(s,a) stepsizes
+    N = np.zeros_like(Q, dtype=np.int64)
     rmse_hist, linf_hist = [], []
     for ep in range(episodes):
         eps = harmonic_eps(ep, eps0=eps0, eps_min=eps_min, scale=50.0)
@@ -275,6 +269,87 @@ def expected_sarsa_with_error(env, episodes=5000, gamma=0.99, alpha0=1.0, beta=1
             linf_hist.append(linf_Q(Q, Q_star, valid_mask))
     return Q, np.array(rmse_hist), np.array(linf_hist)
 
+def q_learning_with_error(env, episodes=5000, gamma=0.99, alpha0=1.0, beta=1.0,
+                          eps0=1.0, eps_min=0.01, Q_star=None, valid_mask=None, seed=3):
+    rng = np.random.default_rng(seed)
+    Q = np.zeros((env.n_states, env.n_actions))
+    N = np.zeros_like(Q, dtype=np.int64)
+    rmse_hist, linf_hist = [], []
+    for ep in range(episodes):
+        eps = harmonic_eps(ep, eps0=eps0, eps_min=eps_min, scale=50.0)
+        s = env.reset(random_start=False)
+        done = False
+        steps = 0
+        while not done and steps < env.max_steps:
+            a = epsilon_greedy(Q, s, eps, rng)  # behavior
+            s_next, rwd, done, _ = env.step(a)
+            if not done:
+                target = rwd + gamma * np.max(Q[s_next])  # greedy bootstrap
+            else:
+                target = rwd
+            N[s, a] += 1
+            alpha = stepsize_from_count(N[s, a], alpha0=alpha0, beta=beta)
+            td = target - Q[s, a]
+            Q[s, a] += alpha * td
+            s = s_next
+            steps += 1
+        if Q_star is not None:
+            rmse_hist.append(rmse_Q(Q, Q_star, valid_mask))
+            linf_hist.append(linf_Q(Q, Q_star, valid_mask))
+    return Q, np.array(rmse_hist), np.array(linf_hist)
+
+
+def double_q_learning_with_error(env, episodes=5000, gamma=0.99, alpha0=1.0, beta=1.0,
+                                 eps0=1.0, eps_min=0.01, Q_star=None, valid_mask=None, seed=4):
+    rng = np.random.default_rng(seed)
+    QA = np.zeros((env.n_states, env.n_actions))
+    QB = np.zeros((env.n_states, env.n_actions))
+    NA = np.zeros_like(QA, dtype=np.int64)
+    NB = np.zeros_like(QB, dtype=np.int64)
+    rmse_hist, linf_hist = [], []
+    for ep in range(episodes):
+        eps = harmonic_eps(ep, eps0=eps0, eps_min=eps_min, scale=50.0)
+        s = env.reset(random_start=False)
+        done = False
+        steps = 0
+        while not done and steps < env.max_steps:
+            # Behavior uses ε-greedy wrt the combined estimate
+            Qsum = QA + QB
+            a = epsilon_greedy(Qsum, s, eps, rng)
+            s_next, rwd, done, _ = env.step(a)
+
+            # Randomly choose which table to update (A or B)
+            if rng.random() < 0.5:
+                NA[s, a] += 1
+                alpha = stepsize_from_count(NA[s, a], alpha0=alpha0, beta=beta)
+                if not done:
+                    a_star = np.argmax(QA[s_next])          # argmax w.r.t. QA
+                    target = rwd + gamma * QB[s_next, a_star]  # evaluate with QB
+                else:
+                    target = rwd
+                td = target - QA[s, a]
+                QA[s, a] += alpha * td
+            else:
+                NB[s, a] += 1
+                alpha = stepsize_from_count(NB[s, a], alpha0=alpha0, beta=beta)
+                if not done:
+                    a_star = np.argmax(QB[s_next])          # argmax w.r.t. QB
+                    target = rwd + gamma * QA[s_next, a_star]  # evaluate with QA
+                else:
+                    target = rwd
+                td = target - QB[s, a]
+                QB[s, a] += alpha * td
+
+            s = s_next
+            steps += 1
+
+        if Q_star is not None:
+            Qavg = 0.5 * (QA + QB)
+            rmse_hist.append(rmse_Q(Qavg, Q_star, valid_mask))
+            linf_hist.append(linf_Q(Qavg, Q_star, valid_mask))
+    Qavg = 0.5 * (QA + QB)
+    return Qavg, np.array(rmse_hist), np.array(linf_hist)
+
 
 # ------------------- Run & evaluate -------------------
 env = GridWorld(max_steps=500)
@@ -282,18 +357,27 @@ gamma = 0.99
 Q_star = value_iteration_Qstar(env, gamma=gamma)
 valid_mask = mask_valid_states(env)
 
-episodes = 30000
+episodes = 5000
 Q_mc, mc_rmse, mc_linf = mc_control_with_error(env, episodes=episodes, gamma=gamma,
-                                               eps0=1.0, eps_min=0.2,
+                                               eps0=1.0, eps_min=0.3,
                                                Q_star=Q_star, valid_mask=valid_mask, seed=0)
 Q_sa, sa_rmse, sa_linf = sarsa_with_error(env, episodes=episodes, gamma=gamma,
-                                          alpha0=1.0, beta=1.0,  # 1/N per (s,a)
+                                          alpha0=1.0, beta=1.0,
                                           eps0=1.0, eps_min=0.01,
                                           Q_star=Q_star, valid_mask=valid_mask, seed=1)
 Q_es, es_rmse, es_linf = expected_sarsa_with_error(env, episodes=episodes, gamma=gamma,
                                                    alpha0=1.0, beta=1.0,
                                                    eps0=1.0, eps_min=0.01,
                                                    Q_star=Q_star, valid_mask=valid_mask, seed=2)
+Q_ql, ql_rmse, ql_linf = q_learning_with_error(env, episodes=episodes, gamma=gamma,
+                                               alpha0=1.0, beta=1.0,
+                                               eps0=1.0, eps_min=0.01,
+                                               Q_star=Q_star, valid_mask=valid_mask, seed=3)
+
+Q_dq, dq_rmse, dq_linf = double_q_learning_with_error(
+    env, episodes=episodes, gamma=0.99, alpha0=1.0, beta=1.0,
+    eps0=1.0, eps_min=0.01, Q_star=Q_star, valid_mask=valid_mask, seed=4
+)
 
 # Final errors
 def sup_errors(Q, Q_star, mask):
@@ -302,15 +386,19 @@ print("Final Linf errors:")
 print("MC:", sup_errors(Q_mc, Q_star, valid_mask))
 print("SARSA:", sup_errors(Q_sa, Q_star, valid_mask))
 print("Expected SARSA:", sup_errors(Q_es, Q_star, valid_mask))
+print("Q-Learning:", sup_errors(Q_ql, Q_star, valid_mask))
+print("Double Q-Learning:", sup_errors(Q_dq, Q_star, valid_mask))
 
 # Plot RMSE vs episodes
-plt.figure(figsize=(7,4))
+plt.figure(figsize=(8,4.2))
 plt.plot(mc_rmse, label="MC Control")
 plt.plot(sa_rmse, label="SARSA (decay)")
 plt.plot(es_rmse, label="Expected SARSA (decay)")
+plt.plot(ql_rmse, label="Q-Learning (decay)")
+plt.plot(dq_rmse, label="Double Q-Learning (decay)")
 plt.xlabel("Episodes")
 plt.ylabel("RMSE(Q, Q*)")
-plt.title("Decaying stepsizes: convergence of Q to Q*")
+plt.title("Convergence of Q-estimates to Q* on GridWorld")
 plt.legend()
 plt.tight_layout()
 plt.show()
@@ -318,8 +406,12 @@ plt.show()
 # Policies for inspection
 pol_mc = greedy_policy_from_Q(Q_mc)
 pol_sa = greedy_policy_from_Q(Q_sa)
-pol_es  = greedy_policy_from_Q(Q_es)
+pol_es = greedy_policy_from_Q(Q_es)
+pol_ql = greedy_policy_from_Q(Q_ql)
+pol_dq = greedy_policy_from_Q(Q_dq)
 print("\nGreedy policies (arrows):")
 print("\nMC Control:\n", env.render_policy(pol_mc))
 print("\nSARSA:\n", env.render_policy(pol_sa))
 print("\nExpected SARSA:\n", env.render_policy(pol_es))
+print("\nQ-Learning:\n", env.render_policy(pol_ql))
+print("\nDouble Q-Learning greedy policy:\n", env.render_policy(pol_dq))
