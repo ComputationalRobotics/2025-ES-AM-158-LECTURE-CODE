@@ -181,7 +181,7 @@ def mc_control_with_error(env, episodes=5000, gamma=0.99, eps0=1.0, eps_min=0.01
     
     for ep in range(episodes):
         eps = harmonic_eps(ep, eps0=eps0, eps_min=eps_min, scale=50.0)
-        s = env.reset(random_start=False)
+        s = env.reset(random_start=True)
         traj = []
         done = False
         while not done:
@@ -189,19 +189,25 @@ def mc_control_with_error(env, episodes=5000, gamma=0.99, eps0=1.0, eps_min=0.01
             s_next, rwd, done, _ = env.step(a)
             traj.append((s, a, rwd))
             s = s_next
-            if len(traj) > env.max_steps: break
+            if len(traj) >= env.max_steps: break
+      
         
+        # reverse traversal to compute returns
         G = 0.0
-        visited = set()
+        returns = [0.0] * len(traj)
         for t in reversed(range(len(traj))):
-            s_t, a_t, r_t1 = traj[t]
+            _, _, r_t1 = traj[t]
             G = gamma * G + r_t1
-            if (s_t, a_t) not in visited:
-                visited.add((s_t, a_t))
-                N[s_t, a_t] += 1
-                # sample-average = 1/N
-                alpha = 1.0 / N[s_t, a_t]
-                Q[s_t, a_t] += alpha * (G - Q[s_t, a_t])
+            returns[t] = G
+
+        # Every-visit MC update
+        visited = set()
+        for t, (s_t, a_t, _) in enumerate(traj):
+            visited.add((s_t, a_t))
+            N[s_t, a_t] += 1
+            alpha = 1 / N[s_t, a_t] 
+            Q[s_t, a_t] += alpha * (returns[t] - Q[s_t, a_t])
+        
         if Q_star is not None:
             rmse_hist.append(rmse_Q(Q, Q_star, valid_mask))
             linf_hist.append(linf_Q(Q, Q_star, valid_mask))
@@ -271,14 +277,14 @@ def expected_sarsa_with_error(env, episodes=5000, gamma=0.99, alpha0=1.0, beta=1
 
 
 # ------------------- Run & evaluate -------------------
-env = GridWorld()
+env = GridWorld(max_steps=500)
 gamma = 0.99
 Q_star = value_iteration_Qstar(env, gamma=gamma)
 valid_mask = mask_valid_states(env)
 
-episodes = 3000
+episodes = 30000
 Q_mc, mc_rmse, mc_linf = mc_control_with_error(env, episodes=episodes, gamma=gamma,
-                                               eps0=1.0, eps_min=0.01,
+                                               eps0=1.0, eps_min=0.2,
                                                Q_star=Q_star, valid_mask=valid_mask, seed=0)
 Q_sa, sa_rmse, sa_linf = sarsa_with_error(env, episodes=episodes, gamma=gamma,
                                           alpha0=1.0, beta=1.0,  # 1/N per (s,a)
