@@ -5,6 +5,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import gymnasium as gym
 
+# python mountaincar_sarsa.py --algo sarsa --episodes 3000 --save --video
+
 # ======================== Utilities ========================
 def normalize_obs(obs, low, high):
     # Map each dim to roughly [-1, 1]
@@ -310,7 +312,7 @@ def main():
     parser.add_argument("--algo", type=str, default="both", choices=["sarsa", "expected_sarsa", "both"], help="Algorithm to run")
     parser.add_argument("--episodes", type=int, default=2500, help="Training episodes")
     parser.add_argument("--gamma", type=float, default=0.99, help="Discount factor")
-    parser.add_argument("--alpha", type=float, default=1e-1, help="Learning rate (Adam)")
+    parser.add_argument("--alpha", type=float, default=1e-2, help="Learning rate (Adam)")
     parser.add_argument("--epsilon-start", type=float, default=1.0, help="Initial epsilon")
     parser.add_argument("--epsilon-end", type=float, default=0.01, help="Final epsilon")
     parser.add_argument("--epsilon-decay", type=float, default=0.997, help="Multiplicative epsilon decay per episode")
