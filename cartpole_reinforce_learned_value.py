@@ -1,5 +1,5 @@
-# REINFORCE on CartPole-v1 (PyTorch) — minibatch with learned value baseline (MSE critic)
-# ---------------------------------------------------------------------------------------
+# REINFORCE on CartPole-v1 (PyTorch) — value-converged critic per batch, single actor step
+# ----------------------------------------------------------------------------------------
 # pip install gymnasium torch matplotlib  (or: pip install gym torch matplotlib)
 
 import os, random, time
@@ -47,8 +47,7 @@ class PolicyNet(nn.Module):
         logits = self.forward(obs)
         dist = torch.distributions.Categorical(logits=logits)
         a = dist.sample()
-        logp = dist.log_prob(a)
-        return a.item(), logp
+        return int(a.item())
 
     def act_deterministic(self, obs):
         """Greedy action (argmax over logits) — handy for evaluation/video."""
@@ -82,7 +81,7 @@ def rollout_episode(env, policy, gamma=0.99, render=False, device="cpu"):
     """
     Collect one episode and return:
       - states per step (Tensor [T, obs_dim])
-      - log-probs per step (Tensor [T])
+      - actions per step (Tensor [T], long)
       - returns-to-go per step (Tensor [T])
       - episode return (float)
       - episode length (int)
@@ -92,7 +91,7 @@ def rollout_episode(env, policy, gamma=0.99, render=False, device="cpu"):
     else:
         obs = env.reset()
     done = False
-    rewards, logps, states = [], [], []
+    rewards, states, acts = [], [], []
     ep_ret = 0.0
     steps = 0
 
@@ -100,26 +99,26 @@ def rollout_episode(env, policy, gamma=0.99, render=False, device="cpu"):
         if render: env.render()
         states.append(np.asarray(obs, dtype=np.float32))
         obs_t = torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        a, logp = policy.act(obs_t)
+        a = policy.act(obs_t)
         if GYMN:
             next_obs, r, terminated, truncated, info = env.step(a)
             done = terminated or truncated
         else:
             next_obs, r, done, info = env.step(a)
         rewards.append(float(r))
-        logps.append(logp)
+        acts.append(int(a))
         ep_ret += float(r)
         obs = next_obs
         steps += 1
 
     G = discount_cumsum(rewards, gamma)
     states_t = torch.tensor(np.array(states), dtype=torch.float32, device=device)
+    acts_t = torch.tensor(acts, dtype=torch.long, device=device)
     G_t = torch.tensor(G, dtype=torch.float32, device=device)
-    logps_t = torch.stack(logps).to(device)
-    return states_t, logps_t, G_t, ep_ret, steps
+    return states_t, acts_t, G_t, ep_ret, steps
 
 # ---- Plotting helper ----
-def plot_training_curve(returns_hist, window=50, out_path="videos/cartpole_returns_value_baseline.png"):
+def plot_training_curve(returns_hist, window=50, out_path="videos/cartpole_returns_value_converged.png"):
     """Plot per-episode returns and a moving average."""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     x = np.arange(1, len(returns_hist) + 1)
@@ -135,7 +134,7 @@ def plot_training_curve(returns_hist, window=50, out_path="videos/cartpole_retur
         plt.plot(np.arange(window, len(rets)+1), ma, label=f"{window}-episode average")
     plt.xlabel("Episode")
     plt.ylabel("Return")
-    plt.title("REINFORCE on CartPole-v1 — Value Baseline")
+    plt.title("REINFORCE on CartPole-v1 — Critic Converged per Batch")
     plt.legend()
     plt.tight_layout()
     plt.savefig(out_path, dpi=150)
@@ -179,7 +178,7 @@ def rollout_and_record_video(policy, video_dir="videos", episodes=1, max_steps=1
             if deterministic:
                 a = policy.act_deterministic(obs_t)
             else:
-                a, _ = policy.act(obs_t)
+                a = policy.act(obs_t)
             if GYMN:
                 obs, r, terminated, truncated, info = env.step(a)
                 done = terminated or truncated
@@ -195,25 +194,33 @@ def rollout_and_record_video(policy, video_dir="videos", episodes=1, max_steps=1
     print(f"[Video] Saved to: {os.path.abspath(video_dir)}")
     return total_returns
 
-# ---- Training: minibatch REINFORCE with learned value baseline (MSE critic) ----
-def train_reinforce_minibatch_value_baseline(
+# ---- Training: per-batch converged critic, then one actor step ----
+def train_reinforce_value_converged(
     episodes=2000,
     gamma=0.99,
     lr_policy=1e-3,
     lr_value=1e-3,
-    batch_size=40,               # number of episodes per update (larger => lower variance)
-    standardize_adv=True,        # normalize advantages across the WHOLE batch
-    ent_coef=1e-2,               # entropy bonus (try 5e-3 ~ 2e-2)
+    batch_size=40,                # number of episodes per update
+    standardize_adv=True,         # normalize advantages across the WHOLE batch
+    ent_coef=1e-2,                # entropy bonus (try 5e-3 ~ 2e-2)
     value_grad_clip=1.0,
     policy_grad_clip=1.0,
-    target_avg_last100=475.0,    # CartPole-v1 "solved" threshold
+    # --- critic inner-loop convergence controls ---
+    value_inner_max_steps=2000,   # hard cap on GD steps for critic
+    value_check_every=10,         # check convergence every N steps
+    value_convergence_tol=1e-6,   # relative improvement tolerance
+    value_patience=10,            # consecutive checks without improvement
+    target_avg_last100=475.0,
     render_every=None,
     device=None
 ):
     """
-    Minibatch REINFORCE with a learned value baseline:
-      - Policy loss: L_pi = - E[ log pi(a_t|s_t) * (G_t - V(s_t)) ] - ent_coef * E[H(pi(.|s_t))]
-      - Value loss:  L_V  =   E[ (G_t - V(s_t))^2 ]
+    Training scheme per minibatch:
+      1) Collect a batch of on-policy trajectories with the *current* actor.
+      2) Fit V(s) to Monte Carlo returns by running many GD steps on the batch
+         until convergence (early-stopping with tolerance/patience).
+      3) Compute advantages A = G - V(s) (critic is now converged on this batch).
+      4) Do *one* actor (policy) update step using those advantages.
     """
     env = make_env()
     obs_dim = env.observation_space.shape[0]
@@ -226,36 +233,67 @@ def train_reinforce_minibatch_value_baseline(
     opt_pi = optim.Adam(policy.parameters(), lr=lr_policy)
     opt_v  = optim.Adam(valuef.parameters(), lr=lr_value)
 
+    mse = nn.MSELoss(reduction="mean")
+
     returns_hist = []
     best_avg = -1e9
     start = time.time()
     episodes_run = 0
 
     while episodes_run < episodes:
-        # ------- Collect one batch of trajectories -------
-        all_states, all_logps, all_G = [], [], []
+        # ------- (1) Collect one batch of trajectories -------
+        all_states, all_acts, all_G = [], [], []
         total_steps = 0
         batch_eps = min(batch_size, episodes - episodes_run)
 
         for _ in range(batch_eps):
             render = (render_every is not None and (episodes_run + 1) % render_every == 0)
-            states_t, logps_t, G_t, ep_ret, steps = rollout_episode(env, policy, gamma, render, device)
+            states_t, acts_t, G_t, ep_ret, steps = rollout_episode(env, policy, gamma, render, device)
             returns_hist.append(ep_ret)
             episodes_run += 1
             total_steps += int(steps)
-
-            all_states.append(states_t)   # [T_i, obs_dim]
-            all_logps.append(logps_t)     # [T_i]
-            all_G.append(G_t)             # [T_i]
+            all_states.append(states_t)
+            all_acts.append(acts_t)
+            all_G.append(G_t)
 
         # Concatenate across all episodes in the batch
         S = torch.cat(all_states, dim=0)        # [N_steps, obs_dim]
-        LOGP = torch.cat(all_logps, dim=0)      # [N_steps]
+        A = torch.cat(all_acts, dim=0)          # [N_steps]
         G = torch.cat(all_G, dim=0)             # [N_steps]
 
-        # ------- Critic: V(s) and advantages (detach for actor) -------
-        V = valuef(S)                            # [N_steps]
-        adv = (G - V.detach())                   # baseline is action-independent
+        # ------- (2) Critic inner loop: fit V(s) until convergence -------
+        best_loss = float("inf")
+        no_improve = 0
+        steps_used = 0
+
+        for k in range(1, value_inner_max_steps + 1):
+            V = valuef(S)
+            v_loss = mse(V, G)
+
+            opt_v.zero_grad(set_to_none=True)
+            v_loss.backward()
+            if value_grad_clip is not None:
+                torch.nn.utils.clip_grad_norm_(valuef.parameters(), max_norm=value_grad_clip)
+            opt_v.step()
+
+            steps_used = k
+            # check convergence every 'value_check_every' steps
+            if k % value_check_every == 0:
+                cur = v_loss.item()
+                # relative improvement w.r.t. best so far
+                rel_impr = (best_loss - cur) / max(1.0, abs(best_loss))
+                if rel_impr <= value_convergence_tol:
+                    no_improve += 1
+                else:
+                    no_improve = 0
+                    best_loss = cur
+                if no_improve >= value_patience:
+                    break
+
+        # ------- (3) Compute advantages with converged critic -------
+        with torch.no_grad():
+            V_final = valuef(S)
+        adv = (G - V_final).detach()
 
         if standardize_adv:
             std = adv.std(unbiased=False)
@@ -264,37 +302,27 @@ def train_reinforce_minibatch_value_baseline(
             else:
                 adv = adv - adv.mean()
 
-        # ------- Policy loss (with entropy bonus; entropy needs gradient!) -------
-        policy_loss = -(LOGP * adv).mean()
+        # ------- (4) Single actor step (policy gradient) -------
         logits_now = policy(S)
         dist_now = torch.distributions.Categorical(logits=logits_now)
-        entropy = dist_now.entropy().mean()
-        policy_loss = policy_loss - ent_coef * entropy
+        logp = dist_now.log_prob(A)             # gradient flows through policy
+        entropy = dist_now.entropy().mean()     # exploration bonus
 
-        # ------- Value loss (MSE to MC returns) -------
-        value_loss = (G - V).pow(2).mean()
+        policy_loss = -(logp * adv).mean() - ent_coef * entropy
 
-        # ------- Update actor -------
         opt_pi.zero_grad(set_to_none=True)
         policy_loss.backward()
         if policy_grad_clip is not None:
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=policy_grad_clip)
         opt_pi.step()
 
-        # ------- Update critic -------
-        opt_v.zero_grad(set_to_none=True)
-        value_loss.backward()
-        if value_grad_clip is not None:
-            torch.nn.utils.clip_grad_norm_(valuef.parameters(), max_norm=value_grad_clip)
-        opt_v.step()
-
         # ------- Logging -------
         avg100 = np.mean(returns_hist[-100:]) if len(returns_hist) >= 1 else 0.0
         best_avg = max(best_avg, avg100)
-        if episodes_run % 10 == 0 or episodes_run == 1:
-            print(f"Eps {episodes_run:4d} | LastRet {returns_hist[-1]:6.1f} | "
-                  f"Avg100 {avg100:6.1f} | Steps(batch) {total_steps:4d} | "
-                  f"L_pi {policy_loss.item():.3f} | Ent {entropy.item():.3f} | L_V {value_loss.item():.3f}")
+        print(f"Eps {episodes_run:4d} | LastRet {returns_hist[-1]:6.1f} | "
+              f"Avg100 {avg100:6.1f} | Steps(batch) {total_steps:4d} | "
+              f"V-steps {steps_used:4d} | BestVLoss {best_loss:.4f} | "
+              f"L_pi {policy_loss.item():.3f} | Ent {entropy.item():.3f}")
 
         if len(returns_hist) >= 100 and avg100 >= target_avg_last100:
             print(f"SOLVED in {episodes_run} episodes! Avg100={avg100:.1f}")
@@ -306,14 +334,18 @@ def train_reinforce_minibatch_value_baseline(
     return policy, valuef, returns_hist
 
 if __name__ == "__main__":
-    policy, valuef, returns = train_reinforce_minibatch_value_baseline(
+    policy, valuef, returns = train_reinforce_value_converged(
         episodes=2000,
         gamma=0.99,
-        lr_policy=1e-3,
+        lr_policy=5e-4,
         lr_value=1e-3,
-        batch_size=40,             # multiple trajectories per update
+        batch_size=50,                # multiple trajectories per update
         standardize_adv=True,
-        ent_coef=1e-2,
+        ent_coef=0,
+        value_inner_max_steps=2000,
+        value_check_every=10,
+        value_convergence_tol=1e-6,
+        value_patience=10,
         render_every=None,
     )
 
