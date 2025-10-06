@@ -337,7 +337,7 @@ if __name__ == "__main__":
     policy, valuef, returns = train_reinforce_value_converged(
         episodes=5000,
         gamma=0.99,
-        lr_policy=1e-3,
+        lr_policy=1e-2,
         lr_value=1e-3,
         batch_size=50,                # multiple trajectories per update
         standardize_adv=True,
