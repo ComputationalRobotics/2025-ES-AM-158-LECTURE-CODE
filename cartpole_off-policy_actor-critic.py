@@ -385,7 +385,7 @@ if __name__ == "__main__":
         batch_size=256,
         start_steps=2_000,
         updates_per_step=1,          # number of update iterations per env step
-        critic_steps_per_update=8,   # <<< tune this for a stronger critic
+        critic_steps_per_update=4,   # <<< tune this for a stronger critic
         is_clip_c=10.0,
         epsilon_start=0.20,
         epsilon_end=0.02,

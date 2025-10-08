@@ -408,7 +408,7 @@ if __name__ == "__main__":
         gamma=0.99,
         lr_policy=1e-3,
         lr_value=1e-3,
-        batch_size=50,                # multiple trajectories per update
+        batch_size=128,                # multiple trajectories per update
         standardize_adv=True,
         ent_coef=0.0,                 # try 1e-3 ~ 2e-2 if exploration needs help
         value_inner_max_steps=2000,

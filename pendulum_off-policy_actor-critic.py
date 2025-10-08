@@ -449,4 +449,4 @@ if __name__ == "__main__":
 
     # ---- Roll out the final policy and RECORD a video ----
     # Set deterministic=True for a stable video (greedy w.r.t. mean action)
-    rollout_and_record_video(policy, video_dir="videos", episodes=5, max_steps=200, deterministic=True)
+    rollout_and_record_video(policy, video_dir="videos", episodes=20, max_steps=200, deterministic=True)
