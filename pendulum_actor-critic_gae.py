@@ -391,7 +391,7 @@ if __name__ == "__main__":
         lam=0.95,               # GAE parameter (bias–variance trade-off)
         lr_actor=1e-4,          # smaller actor lr often helps stability on Pendulum
         lr_critic=1e-3,
-        batch_size=128,          # multiple trajectories per update
+        batch_size=2048,          # multiple trajectories per update
         critic_steps_per_update=20,
         normalize_adv=True,
         render_every=None,
