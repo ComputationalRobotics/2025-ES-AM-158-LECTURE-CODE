@@ -1,15 +1,21 @@
-# Soft Actor–Critic (SAC) on Pendulum-v1 — twin critics, target nets, auto-α, replay, video
-# ------------------------------------------------------------------------------------------
-# pip install gymnasium torch matplotlib  (or: pip install gym torch matplotlib)
+# SAC (Continuous) on Pendulum-v1 with Twin Critics & Auto-Entropy
+# ---------------------------------------------------------------
+# Features:
+#   • Reparameterized tanh-Gaussian policy (with correct tanh log-Jacobian)
+#   • Twin critics + twin target critics (min backup)
+#   • Optional automatic temperature tuning (default on)
+#   • Plots per-episode return (learning curve)
+#   • Saves evaluation rollouts as videos
 
 import os, random, math, time
+from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-# --- Gym import with fallback (Gymnasium preferred) ---
+# ---- Gym import with fallback (Gymnasium preferred) ----
 try:
     import gymnasium as gym
     GYMN = True
@@ -17,370 +23,376 @@ except Exception:
     import gym
     GYMN = False
 
-# ---- Reproducibility ----
+# ----------------- Reproducibility ----------------------
 SEED = 42
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
-def make_env(seed=SEED):
-    env = gym.make("Pendulum-v1")
+def make_env(seed=SEED, render_for_video=False):
+    """Create Pendulum env. For Gymnasium video, we need render_mode='rgb_array'."""
+    if GYMN and render_for_video:
+        env = gym.make("Pendulum-v1", render_mode="rgb_array")
+    else:
+        env = gym.make("Pendulum-v1")
     try:
         env.reset(seed=seed)
     except TypeError:
-        if hasattr(env, "seed"):
-            env.seed(seed)
-    if hasattr(env.action_space, "seed"):
-        env.action_space.seed(seed)
+        try: env.seed(seed)
+        except Exception: pass
     return env
 
-# =========================
-#    Tanh-Gaussian utils
-# =========================
-LOG_2PI = math.log(2.0 * math.pi)
+def make_video_env(video_dir, seed=SEED):
+    """Wrap an env to record videos to `video_dir`."""
+    os.makedirs(video_dir, exist_ok=True)
+    env = make_env(seed=seed, render_for_video=True)
+    try:
+        from gymnasium.wrappers import RecordVideo as GymnRecordVideo
+        env = GymnRecordVideo(env, video_folder=video_dir,
+                              episode_trigger=lambda ep: True,
+                              name_prefix="sac_continuous")
+    except Exception:
+        if hasattr(gym.wrappers, "RecordVideo"):
+            env = gym.wrappers.RecordVideo(env, video_folder=video_dir,
+                                           episode_trigger=lambda ep: True)
+        else:
+            env = gym.wrappers.Monitor(env, video_dir, force=True)
+    return env
 
-def atanh(x):
-    return 0.5 * (torch.log1p(x) - torch.log1p(-x))
+# ----------------- Replay Buffer ------------------------
+class ReplayBuffer:
+    def __init__(self, obs_dim, act_dim, size):
+        self.obs = np.zeros((size, obs_dim), dtype=np.float32)
+        self.act = np.zeros((size, act_dim), dtype=np.float32)
+        self.rew = np.zeros((size, 1), dtype=np.float32)
+        self.nxt = np.zeros((size, obs_dim), dtype=np.float32)
+        self.done = np.zeros((size, 1), dtype=np.float32)
+        self.ptr = 0; self.size = 0; self.max_size = size
 
-def gaussian_log_prob(u, mean, log_std):
-    var = torch.exp(2.0 * log_std)
-    return -0.5 * (((u - mean) ** 2) / var + 2.0 * log_std + LOG_2PI).sum(dim=-1)  # (B,)
+    def push(self, s, a, r, s2, d):
+        self.obs[self.ptr] = s
+        self.act[self.ptr] = a
+        self.rew[self.ptr] = r
+        self.nxt[self.ptr] = s2
+        self.done[self.ptr] = d
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
 
-def sample_squashed_gaussian(mean, log_std, act_scale):
-    """
-    Reparameterized sample a = scale * tanh(u), u ~ N(mean, std)
-    Returns: a (B,A), logp(a|s) (B,)
-    """
-    std = torch.exp(log_std)
-    eps = torch.randn_like(mean)
-    u = mean + std * eps
-    a = act_scale * torch.tanh(u)
-    # log prob of squashed sample
-    base_logp = gaussian_log_prob(u, mean, log_std)  # (B,)
-    log_det = (torch.log(act_scale) + torch.log(1.0 - torch.tanh(u) ** 2 + 1e-6)).sum(dim=-1)
-    logp = base_logp - log_det
-    return a, logp
+    def sample(self, batch_size, device):
+        idxs = np.random.randint(0, self.size, size=batch_size)
+        to_t = lambda x, dtype=torch.float32: torch.as_tensor(x[idxs], dtype=dtype, device=device)
+        s   = to_t(self.obs)
+        a   = to_t(self.act)
+        r   = to_t(self.rew)
+        s2  = to_t(self.nxt)
+        d   = to_t(self.done)
+        return s, a, r, s2, d
 
-# =========================
-#         Networks
-# =========================
-class Policy(nn.Module):
-    """Tanh-squashed Gaussian policy."""
-    def __init__(self, obs_dim, act_dim, hidden=256, log_std_min=-5.0, log_std_max=2.0, act_scale=1.0):
+# ----------------- Networks -----------------------------
+def mlp(sizes, act=nn.ReLU, out_act=None):
+    layers = []
+    for j in range(len(sizes)-1):
+        layers += [nn.Linear(sizes[j], sizes[j+1])]
+        if j < len(sizes)-2:
+            layers += [act()]
+        elif out_act is not None:
+            layers += [out_act()]
+    return nn.Sequential(*layers)
+
+class Actor(nn.Module):
+    """Tanh-squashed Gaussian with reparameterization; returns action and log_prob (with tanh correction)."""
+    def __init__(self, obs_dim, act_dim, act_low, act_high, hidden=(256,256)):
         super().__init__()
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
-        self.register_buffer('act_scale', torch.as_tensor(act_scale, dtype=torch.float32))
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-        )
-        self.mu = nn.Linear(hidden, act_dim)
-        self.log_std = nn.Linear(hidden, act_dim)
+        self.net = mlp([obs_dim, *hidden, 2*act_dim])
+        self.register_buffer("act_low",  torch.as_tensor(act_low,  dtype=torch.float32))
+        self.register_buffer("act_high", torch.as_tensor(act_high, dtype=torch.float32))
+        self.register_buffer("eps", torch.tensor(1e-6, dtype=torch.float32))
+        self._update_scale_bias()
 
-    def forward(self, s):
-        h = self.net(s)
-        mu = self.mu(h)
-        log_std = self.log_std(h).clamp(self.log_std_min, self.log_std_max)
-        return mu, log_std
+    def _update_scale_bias(self):
+        self.act_scale = (self.act_high - self.act_low) / 2.0
+        self.act_bias  = (self.act_high + self.act_low) / 2.0
+
+    def _dist_params(self, obs):
+        h = self.net(obs)
+        act_dim = h.shape[-1] // 2
+        mu, log_std = h[..., :act_dim], h[..., act_dim:]
+        log_std = torch.clamp(log_std, -20, 2)
+        std = torch.exp(log_std)
+        return mu, std
+
+    def rsample(self, obs):
+        mu, std = self._dist_params(obs)
+        dist = torch.distributions.Normal(mu, std)
+        u = dist.rsample()
+        a_tanh = torch.tanh(u)
+        a = self.act_scale * a_tanh + self.act_bias
+        # log-prob with tanh correction (drop affine constant)
+        logp_u = dist.log_prob(u).sum(dim=-1, keepdim=True)
+        log_det = torch.log(1 - a_tanh.pow(2) + self.eps).sum(dim=-1, keepdim=True)
+        logp = logp_u - log_det
+        return a, logp, a_tanh, u
 
     @torch.no_grad()
-    def act(self, s, deterministic=False):
-        mu, log_std = self.forward(s)
+    def act(self, obs, deterministic=False):
+        obs_t = torch.as_tensor(obs, dtype=torch.float32).unsqueeze(0)
+        mu, std = self._dist_params(obs_t)
         if deterministic:
-            a = self.act_scale * torch.tanh(mu)
-            return a
-        a, _ = sample_squashed_gaussian(mu, log_std, self.act_scale)
-        return a
+            u = mu
+        else:
+            u = torch.distributions.Normal(mu, std).sample()
+        a_tanh = torch.tanh(u)
+        a = self.act_scale * a_tanh + self.act_bias
+        return a.squeeze(0).cpu().numpy()
 
-class QNet(nn.Module):
-    """Q(s,a) network."""
-    def __init__(self, obs_dim, act_dim, hidden=256):
+class CriticTwin(nn.Module):
+    """Twin Q networks; input is state-action concatenation."""
+    def __init__(self, obs_dim, act_dim, hidden=(256,256)):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim + act_dim, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, 1),
-        )
+        self.q1 = mlp([obs_dim + act_dim, *hidden, 1])
+        self.q2 = mlp([obs_dim + act_dim, *hidden, 1])
     def forward(self, s, a):
         x = torch.cat([s, a], dim=-1)
-        return self.net(x).squeeze(-1)  # (B,)
+        return self.q1(x), self.q2(x)
 
-# =========================
-#      Replay Buffer
-# =========================
-class ReplayBuffer:
-    def __init__(self, capacity, obs_dim, act_dim):
-        self.capacity = int(capacity)
-        self.idx = 0
-        self.full = False
-        self.s  = np.zeros((self.capacity, obs_dim), dtype=np.float32)
-        self.a  = np.zeros((self.capacity, act_dim), dtype=np.float32)
-        self.r  = np.zeros((self.capacity,), dtype=np.float32)
-        self.s2 = np.zeros((self.capacity, obs_dim), dtype=np.float32)
-        self.d  = np.zeros((self.capacity,), dtype=np.float32)
-    def push(self, s, a, r, s2, d):
-        self.s[self.idx]  = s
-        self.a[self.idx]  = a
-        self.r[self.idx]  = r
-        self.s2[self.idx] = s2
-        self.d[self.idx]  = d
-        self.idx = (self.idx + 1) % self.capacity
-        self.full = self.full or (self.idx == 0)
-    def __len__(self): return self.capacity if self.full else self.idx
-    def sample(self, batch_size):
-        n = len(self)
-        idxs = np.random.randint(0, n, size=batch_size)
-        return self.s[idxs], self.a[idxs], self.r[idxs], self.s2[idxs], self.d[idxs]
-
-# =========================
-#      Plotting / Video
-# =========================
-def plot_training_curve(returns_hist, window=50, out_path="videos/pendulum_sac_returns.png"):
-    x = np.arange(1, len(returns_hist) + 1)
-    rets = np.array(returns_hist, dtype=float)
-    ma = np.convolve(rets, np.ones(window)/window, mode="valid") if len(rets) >= window else None
-    plt.figure(figsize=(8, 4.5))
-    plt.plot(x, rets, label="Return per episode")
-    if ma is not None:
-        plt.plot(np.arange(window, len(rets)+1), ma, label=f"{window}-episode average")
-    plt.xlabel("Episode"); plt.ylabel("Return")
-    plt.title("SAC on Pendulum-v1 — Training Curve")
-    plt.legend(); plt.tight_layout()
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    plt.savefig(out_path, dpi=150)
-    print(f"[Plot] Saved training curve to {out_path}")
-
-def rollout_and_record_video(policy, video_dir="videos", episodes=1, max_steps=200, deterministic=True):
-    os.makedirs(video_dir, exist_ok=True)
-    if GYMN:
-        env = gym.make("Pendulum-v1", render_mode="rgb_array")
-        env = gym.wrappers.RecordVideo(env, video_folder=video_dir, episode_trigger=lambda e: True)
-    else:
-        env = gym.make("Pendulum-v1")
-        env = gym.wrappers.Monitor(env, video_dir, force=True, video_callable=lambda e: True)
-    dev = next(policy.parameters()).device
-    total_returns = []
-    for ep in range(episodes):
-        if GYMN:
-            obs, info = env.reset()
-        else:
-            obs = env.reset()
-        done, steps, ep_ret = False, 0, 0.0
-        while not done and steps < max_steps:
-            s_t = torch.tensor(obs, dtype=torch.float32, device=dev).unsqueeze(0)
-            with torch.no_grad():
-                a = policy.act(s_t, deterministic=deterministic).squeeze(0).cpu().numpy()
-            if GYMN:
-                obs, r, terminated, truncated, _ = env.step(a.astype(np.float32))
-                done = terminated or truncated
-            else:
-                obs, r, done, _ = env.step(a.astype(np.float32))
-            ep_ret += float(r); steps += 1
-        total_returns.append(ep_ret)
-        print(f"[Video] Episode {ep+1}/{episodes} return: {ep_ret:.1f}")
-    env.close()
-    print(f"[Video] Saved to: {os.path.abspath(video_dir)}")
-    return total_returns
-
-# =========================
-#          SAC
-# =========================
-def soft_update(target, source, tau=0.005):
+def soft_update(net_src, net_tgt, tau):
     with torch.no_grad():
-        for p_t, p in zip(target.parameters(), source.parameters()):
-            p_t.data.mul_(1 - tau).add_(tau * p.data)
+        for p, p_t in zip(net_src.parameters(), net_tgt.parameters()):
+            p_t.data.mul_(1 - tau)
+            p_t.data.add_(tau * p.data)
 
-def train_sac_pendulum(
-    episodes=800,
-    gamma=0.99,
-    tau=0.005,
-    lr=3e-4,
-    buffer_capacity=300_000,
-    batch_size=256,
-    start_steps=2_000,          # initial random exploration steps
-    updates_per_step=1,         # gradient steps per env step after warmup
-    critic_steps_per_update=1,  # extra critic steps (optional)
-    target_entropy_scale=1.0,   # target entropy = -scale * act_dim
-    device=None
-):
-    """
-    SAC with:
-      - Tanh-Gaussian actor (reparameterized)
-      - Twin critics + target critics
-      - Automatic temperature α tuning toward target entropy = -scale * act_dim
-    """
-    env = make_env()
-    obs_dim = env.observation_space.shape[0]
-    act_dim = env.action_space.shape[0]
-    act_scale = float(env.action_space.high[0])  # Pendulum: 2.0
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+# ----------------- Config -------------------------------
+@dataclass
+class Config:
+    total_env_steps: int = 50_000
+    start_random_steps: int = 1_000
+    update_after: int = 1_000
+    update_every: int = 50
+    updates_per_step: int = 1
 
-    # Networks
-    actor = Policy(obs_dim, act_dim, hidden=256, act_scale=act_scale).to(device)
-    q1 = QNet(obs_dim, act_dim, hidden=256).to(device)
-    q2 = QNet(obs_dim, act_dim, hidden=256).to(device)
-    q1_targ = QNet(obs_dim, act_dim, hidden=256).to(device)
-    q2_targ = QNet(obs_dim, act_dim, hidden=256).to(device)
-    q1_targ.load_state_dict(q1.state_dict())
-    q2_targ.load_state_dict(q2.state_dict())
+    buffer_size: int = 200_000
+    batch_size: int = 256
 
-    # Optimizers
-    opt_actor = optim.Adam(actor.parameters(), lr=lr)
-    opt_q1 = optim.Adam(q1.parameters(), lr=lr)
-    opt_q2 = optim.Adam(q2.parameters(), lr=lr)
+    gamma: float = 0.99
+    tau: float = 0.005
 
-    # Temperature (auto-tuning)
-    target_entropy = - target_entropy_scale * act_dim
-    log_alpha = torch.tensor(0.0, requires_grad=True, device=device)  # α=1 init
-    opt_alpha = optim.Adam([log_alpha], lr=lr)
+    auto_alpha: bool = True
+    alpha: float = 0.2           # used if auto_alpha=False
+    target_entropy_scale: float = 1.0  # multiply by (-act_dim)
 
-    # Replay
-    buf = ReplayBuffer(buffer_capacity, obs_dim, act_dim)
-    to_t = lambda x: torch.as_tensor(x, dtype=torch.float32, device=device)
+    actor_lr: float = 3e-4
+    critic_lr: float = 3e-4
+    alpha_lr: float = 3e-4
 
-    returns_hist = []
-    best_avg = -1e9
-    total_steps = 0
-    last_actor_loss = None
-    last_critic_loss = None
-    last_alpha = float(torch.exp(log_alpha).item())
+    hidden_actor: tuple = (256,256)
+    hidden_critic: tuple = (256,256)
 
-    for ep in range(1, episodes + 1):
-        if GYMN:
-            obs, info = env.reset(seed=SEED + ep)
-        else:
-            if hasattr(env, "seed"): env.seed(SEED + ep)
-            obs = env.reset()
-        done, ep_ret = False, 0.0
+    device: str = "cpu"
+    log_every: int = 2_000
+    eval_episodes: int = 5
+    video_episodes: int = 3
+    video_dir: str = "videos_sac_pendulum"
+    plot_path: str = "sac_continuous_pendulum_learning_curve.png"
 
+# ----------------- Eval / Plot / Video ------------------
+@torch.no_grad()
+def evaluate_avg_return(env, actor, episodes=5, deterministic=True):
+    scores = []
+    for _ in range(episodes):
+        s, _ = env.reset() if GYMN else env.reset()
+        done = False; ep_ret = 0.0
         while not done:
-            # ----- Action selection -----
-            if total_steps < start_steps:
-                a = env.action_space.sample().astype(np.float32)  # pure random
-            else:
-                s_t = to_t(obs).unsqueeze(0)
-                with torch.no_grad():
-                    a = actor.act(s_t, deterministic=False).squeeze(0).cpu().numpy().astype(np.float32)
-
-            # ----- Step env -----
+            a = actor.act(s, deterministic=deterministic)
+            step_out = env.step(a)
             if GYMN:
-                nobs, r, terminated, truncated, _ = env.step(a)
+                s, r, terminated, truncated, _ = step_out
                 done = terminated or truncated
             else:
-                nobs, r, done, _ = env.step(a)
-            buf.push(obs, a, float(r), nobs, float(done))
-            obs = nobs
-            ep_ret += float(r)
-            total_steps += 1
+                s, r, done, _ = step_out
+            ep_ret += r
+        scores.append(ep_ret)
+    return float(np.mean(scores))
 
-            # ----- Updates -----
-            if len(buf) >= max(batch_size, start_steps):
-                for _ in range(updates_per_step):
-                    # multiple critic-only steps if requested
-                    for _c in range(int(critic_steps_per_update)):
-                        s, a_b, r_b, s2, d_b = buf.sample(batch_size)
-                        S  = to_t(s)       # (B,obs)
-                        A  = to_t(a_b)     # (B,act)
-                        R  = to_t(r_b)     # (B,)
-                        S2 = to_t(s2)      # (B,obs)
-                        D  = to_t(d_b)     # (B,)
+def record_videos(actor, cfg):
+    env_v = make_video_env(cfg.video_dir, seed=SEED+123)
+    try:
+        for _ in range(cfg.video_episodes):
+            s, _ = env_v.reset() if GYMN else env_v.reset()
+            done = False
+            while not done:
+                a = actor.act(s, deterministic=True)
+                step_out = env_v.step(a)
+                if GYMN:
+                    s, r, terminated, truncated, _ = step_out
+                    done = terminated or truncated
+                else:
+                    s, r, done, _ = step_out
+        print(f"[Video] Saved evaluation rollouts to: {os.path.abspath(cfg.video_dir)}")
+    finally:
+        env_v.close()
 
-                        with torch.no_grad():
-                            mu2, log_std2 = actor(S2)
-                            a2, logp2 = sample_squashed_gaussian(mu2, log_std2, actor.act_scale)  # (B,A),(B,)
-                            q1_t = q1_targ(S2, a2)
-                            q2_t = q2_targ(S2, a2)
-                            q_t_min = torch.min(q1_t, q2_t)
-                            alpha = torch.exp(log_alpha)
-                            y = R + gamma * (1.0 - D) * (q_t_min - alpha * logp2)  # (B,)
+def plot_learning_curve(returns, cfg):
+    if not returns:
+        print("[Plot] No returns to plot.")
+        return
+    plt.figure(figsize=(7,4.5))
+    xs = np.arange(1, len(returns)+1)
+    plt.plot(xs, returns, linewidth=2)
+    plt.xlabel("Episode")
+    plt.ylabel("Return")
+    plt.title("SAC (Continuous, Twin Critics) on Pendulum-v1 — Learning Curve")
+    plt.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(cfg.plot_path, dpi=160)
+    try:
+        plt.show()
+    except Exception:
+        pass
+    print(f"[Plot] Saved learning curve to: {os.path.abspath(cfg.plot_path)}")
 
-                        q1_pred = q1(S, A)
-                        q2_pred = q2(S, A)
-                        loss_q1 = (q1_pred - y).pow(2).mean()
-                        loss_q2 = (q2_pred - y).pow(2).mean()
+# ----------------- Training Loop ------------------------
+def train_sac_pendulum(cfg=Config()):
+    device = torch.device(cfg.device)
+    env = make_env(SEED)
+    obs_dim = env.observation_space.shape[0]     # Pendulum: 3
+    act_dim = env.action_space.shape[0]          # Pendulum: 1
+    act_low, act_high = env.action_space.low, env.action_space.high
 
-                        opt_q1.zero_grad(set_to_none=True)
-                        loss_q1.backward()
-                        torch.nn.utils.clip_grad_norm_(q1.parameters(), 1.0)
-                        opt_q1.step()
+    # Modules
+    actor = Actor(obs_dim, act_dim, act_low, act_high, cfg.hidden_actor).to(device)
+    critic = CriticTwin(obs_dim, act_dim, cfg.hidden_critic).to(device)
+    critic_targ = CriticTwin(obs_dim, act_dim, cfg.hidden_critic).to(device)
+    critic_targ.load_state_dict(critic.state_dict())
 
-                        opt_q2.zero_grad(set_to_none=True)
-                        loss_q2.backward()
-                        torch.nn.utils.clip_grad_norm_(q2.parameters(), 1.0)
-                        opt_q2.step()
+    pi_optim = torch.optim.Adam(actor.parameters(), lr=cfg.actor_lr)
+    q_optim  = torch.optim.Adam(critic.parameters(), lr=cfg.critic_lr)
 
-                        last_critic_loss = float(0.5 * (loss_q1.item() + loss_q2.item()))
+    # Temperature
+    if cfg.auto_alpha:
+        target_entropy = - cfg.target_entropy_scale * float(act_dim)  # ≈ −dim(A)
+        log_alpha = torch.tensor(math.log(cfg.alpha), requires_grad=True, device=device)
+        alpha_optim = torch.optim.Adam([log_alpha], lr=cfg.alpha_lr)
+        alpha = lambda: log_alpha.exp()
+    else:
+        target_entropy = None
+        alpha = lambda: torch.tensor(cfg.alpha, device=device)
 
-                    # ---- Actor & α updates (one step) ----
-                    s, a_b, r_b, s2, d_b = buf.sample(batch_size)
-                    S = to_t(s)
+    # Buffer
+    rb = ReplayBuffer(obs_dim, act_dim, cfg.buffer_size)
 
-                    mu, log_std = actor(S)
-                    a_new, logp = sample_squashed_gaussian(mu, log_std, actor.act_scale)  # (B,A),(B,)
-                    q1_pi = q1(S, a_new)
-                    q2_pi = q2(S, a_new)
-                    q_pi_min = torch.min(q1_pi, q2_pi)
-                    alpha = torch.exp(log_alpha)
+    # Run
+    s, _ = env.reset() if GYMN else env.reset()
+    ep_ret, ep_len = 0.0, 0
+    returns = []; episodes = 0
 
-                    # Actor loss: minimize E[ α logπ - Q_min ]
-                    actor_loss = (alpha.detach() * logp - q_pi_min).mean()
-                    opt_actor.zero_grad(set_to_none=True)
-                    actor_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(actor.parameters(), 1.0)
-                    opt_actor.step()
-                    last_actor_loss = float(actor_loss.item())
+    for t in range(1, cfg.total_env_steps + 1):
+        # ----- Action -----
+        if t < cfg.start_random_steps:
+            a = env.action_space.sample()
+        else:
+            a = actor.act(s, deterministic=False)
 
-                    # Temperature update
+        # ----- Step env -----
+        step_out = env.step(a)
+        if GYMN:
+            s2, r, terminated, truncated, _ = step_out
+            done = terminated or truncated
+            d_mask = float(done)
+        else:
+            s2, r, done, _ = step_out
+            d_mask = float(done)
+
+        rb.push(s, a, r, s2, d_mask)
+        ep_ret += r; ep_len += 1
+        s = s2
+
+        if done:
+            episodes += 1
+            returns.append(ep_ret)
+            s, _ = env.reset() if GYMN else env.reset()
+            ep_ret, ep_len = 0.0, 0
+
+        # ----- Learn -----
+        if t >= cfg.update_after and t % cfg.update_every == 0:
+            for _ in range(cfg.updates_per_step * cfg.update_every):
+                if rb.size < cfg.batch_size:
+                    break
+                bs, ba, br, bs2, bd = rb.sample(cfg.batch_size, device)
+
+                # --- Target computation ---
+                with torch.no_grad():
+                    a2, logp2, _, _ = actor.rsample(bs2)
+                    q1_t, q2_t = critic_targ(bs2, a2)
+                    q_min_t = torch.min(q1_t, q2_t)
+                    y = br + cfg.gamma * (1.0 - bd) * (q_min_t - alpha() * logp2)
+
+                # --- Critic update ---
+                q1, q2 = critic(bs, ba)
+                q_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
+                q_optim.zero_grad()
+                q_loss.backward()
+                q_optim.step()
+
+                # --- Actor update (reparameterized) ---
+                a_new, logp, _, _ = actor.rsample(bs)
+                q1_pi, q2_pi = critic(bs, a_new)
+                q_pi = torch.min(q1_pi, q2_pi)
+                pi_loss = (alpha() * logp - q_pi).mean()
+                pi_optim.zero_grad()
+                pi_loss.backward()
+                pi_optim.step()
+
+                # --- Temperature (optional) ---
+                if cfg.auto_alpha:
                     alpha_loss = -(log_alpha * (logp.detach() + target_entropy)).mean()
-                    opt_alpha.zero_grad(set_to_none=True)
+                    alpha_optim.zero_grad()
                     alpha_loss.backward()
-                    opt_alpha.step()
-                    last_alpha = float(torch.exp(log_alpha).item())
+                    alpha_optim.step()
 
-                    # Target networks
-                    soft_update(q1_targ, q1, tau)
-                    soft_update(q2_targ, q2, tau)
+                # --- Target networks ---
+                soft_update(critic, critic_targ, cfg.tau)
 
-        returns_hist.append(ep_ret)
-        avg100 = np.mean(returns_hist[-100:])
-        best_avg = max(best_avg, avg100)
-
-        if ep % 10 == 0 or ep == 1:
-            aL = "n/a" if last_actor_loss is None else f"{last_actor_loss:+.4f}"
-            cL = "n/a" if last_critic_loss is None else f"{last_critic_loss:.4f}"
-            print(
-                f"Ep {ep:4d} | Ret {ep_ret:7.1f} | Avg100 {avg100:7.1f} | "
-                f"Steps {total_steps:6d} | ActorL {aL} | CriticL {cL} | α {last_alpha:.3f}"
-            )
-
-        # Early stop (illustrative threshold; Pendulum returns are negative)
-        if len(returns_hist) >= 100 and avg100 >= -250.0:
-            print(f"Reached target in {ep} episodes! Avg100={avg100:.1f}")
-            break
+        # ----- Logging -----
+        if t % cfg.log_every == 0:
+            avg_recent = np.mean(returns[-10:]) if len(returns) >= 10 else (np.mean(returns) if returns else 0.0)
+            eval_env = make_env(SEED+7)
+            eval_score = evaluate_avg_return(eval_env, actor, cfg.eval_episodes, deterministic=True) \
+                         if len(returns) > 5 else float('nan')
+            eval_env.close()
+            print(f"[t={t}] episodes={episodes} recent10={avg_recent:.1f} eval_avg={eval_score:.1f} "
+                  f"rb={rb.size} alpha={alpha().item():.4f}")
 
     env.close()
-    print("Training finished.")
-    return actor, (q1, q2), returns_hist
+    print(f"Training done. Episodes: {episodes}. "
+          f"Final 10-avg return: {(np.mean(returns[-10:]) if len(returns)>=10 else np.mean(returns)):.1f}")
 
-# =========================
-#           Main
-# =========================
+    # --------- (1) Plot learning curve ----------
+    plot_learning_curve(returns, cfg)
+
+    # --------- (2) Record evaluation videos ----------
+    record_videos(actor, cfg)
+
+    return returns, actor, critic
+
 if __name__ == "__main__":
-    actor, critics, returns = train_sac_pendulum(
-        episodes=1000,
+    _ = train_sac_pendulum(Config(
+        total_env_steps=50_000,
+        start_random_steps=1_000,
+        update_after=1_000,
+        update_every=50,
+        updates_per_step=1,
+        buffer_size=200_000,
+        batch_size=256,
         gamma=0.99,
         tau=0.005,
-        lr=3e-4,
-        buffer_capacity=300_000,
-        batch_size=256,
-        start_steps=2_000,
-        updates_per_step=1,
-        critic_steps_per_update=1,
-        target_entropy_scale=1.0,   # target entropy = -1.0 * act_dim
-    )
-
-    # ---- Plot training curve ----
-    os.makedirs("videos", exist_ok=True)
-    plot_training_curve(returns, window=50, out_path="videos/pendulum_sac_returns.png")
-
-    # ---- Save a rollout video ----
-    rollout_and_record_video(actor, video_dir="videos", episodes=1, max_steps=200, deterministic=True)
+        auto_alpha=True,     # set False to use fixed alpha below
+        alpha=0.2,
+        target_entropy_scale=1.0,  # target_entropy = -scale * act_dim
+        actor_lr=3e-4,
+        critic_lr=3e-4,
+        alpha_lr=3e-4,
+        device="cpu",
+        log_every=2_000,
+        eval_episodes=5,
+        video_episodes=3,
+        video_dir="videos_sac_pendulum",
+        plot_path="sac_continuous_pendulum_learning_curve.png"
+    ))
