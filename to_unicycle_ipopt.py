@@ -102,11 +102,13 @@ def initial_guess(P: Params):
     U[:, 0] = v_guess
     U[:, 1] = 0.0
     # pack
-    z0 = np.zeros(P.Z_DIM)
-    for k in range(P.N):
-        z0[idx_x(k, P)] = X[k, :]
-        z0[idx_u(k, P)] = U[k, :]
-    z0[idx_x(P.N, P)] = X[P.N, :]
+    z0 = np.random.randn(P.Z_DIM) # random initialization
+    # z0 = np.zeros(P.Z_DIM) # all-zero initialization
+    # straight-line initialization
+    # for k in range(P.N):
+    #     z0[idx_x(k, P)] = X[k, :]
+    #     z0[idx_u(k, P)] = U[k, :]
+    # z0[idx_x(P.N, P)] = X[P.N, :]
     return z0
 
 
